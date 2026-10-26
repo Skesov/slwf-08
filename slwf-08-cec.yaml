@@ -1,0 +1,911 @@
+# SMLIGHT SLWF-08 HDMI-CEC bridge - living room - generic version
+# Based on smlight-tech/slwf-08/esphome-configs/slwf-08-Palakis.yaml
+#
+# This firmware does not know which device is on which CEC address.
+# It finds the devices itself, so you do not need new firmware when you
+# add, remove or move a device:
+#  - Scan: on boot, each 10 minutes, and with the "CEC scan" button / "cec_scan" action.
+#    The scan sends a CEC polling message to logical addresses 0..14.
+#    For each device that answers, it asks: physical address, OSD name, vendor ID, power status.
+#  - Passive discovery: a message from an unknown address also adds that device.
+#  - Power poll: each 30 s to each device that was found.
+#  - One "CEC <n>" slot sensor per logical address 0..14. Format:
+#      "<power> | <OSD name> | <physical address> | <vendor ID>"
+#      for example "on | SHIELD | 1.2.0.0 | 00044B"  or  "absent"
+#    Home Assistant finds a device by its OSD name, not by its address.
+#  - Each received message also goes to Home Assistant as event "esphome.hdmi_cec".
+#  - The bridge answers requests from other devices itself (physical address, OSD name,
+#    power status, CEC version, Feature Abort). The built-in handlers of the component
+#    do not run, because the catch-all on_message trigger handles all messages.
+#  - Control by name, logical or physical address: "cec_command" action
+#    (commands: on, standby, toggle, select). Works also for devices behind the Marantz.
+#  - Physical address of this bridge can be changed at runtime with the
+#    "set_physical_address" action (for example "3.0.0.0"). It is kept in flash.
+#    The SLWF-08 has no DDC (EDID) connection, thus it cannot find its own port.
+#    A conflict with another device is shown on "Bridge physical address".
+#  - Logical address of this bridge: selected at boot. The bridge polls candidate
+#    addresses and takes the first free one (preferred: the value in flash, default 10).
+#    Change it with the "set_logical_address" action (-1 = select again automatically).
+#
+# Fixed by the CEC standard (thus safe to use directly):
+#   logical 0 = TV, logical 5 = audio system (the Marantz). Only 1 audio system is permitted.
+#
+# Keep "name" and "name_add_mac_suffix" the same. Then OTA, the HA device and the
+# action name "esphome.hdmi_control_palakis_fb09b2_hdmi_cec_send" stay the same.
+
+substitutions:
+  name: "hdmi-control-palakis"
+  friendly_name: "HDMI Control - palakis"
+  project_name: "SMLIGHT.SLWF-08-HDMI"
+  project_version: "3.4-generic"
+  # Default physical address of this bridge: TV HDMI 3 = 3.0.0.0.
+  # Used only on the first boot. After that, the value in flash is used
+  # (change it with the "set_physical_address" action).
+  default_physical_address: "0x3000"
+
+esphome:
+  name: "${name}"
+  friendly_name: "${friendly_name}"
+  name_add_mac_suffix: true
+  project:
+    name: "${project_name}"
+    version: "${project_version}"
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          id(cec).set_physical_address(id(own_phys));
+          char buf[24];
+          uint16_t pa = id(own_phys);
+          snprintf(buf, sizeof(buf), "%X.%X.%X.%X", pa >> 12, (pa >> 8) & 0xF, (pa >> 4) & 0xF, pa & 0xF);
+          id(bridge_phys).publish_state(buf);
+          for (int i = 0; i < 15; i++) id(publish_slot).execute(i);
+      - delay: 8s
+      - script.execute: allocate_address
+      - script.wait: allocate_address
+      - delay: 2s
+      - script.execute: scan_bus
+      - script.wait: scan_bus
+      - delay: 2s
+      - hdmi_cec.send:
+          destination: 0xF
+          data: [0x85]          # Request Active Source (broadcast)
+
+esp8266:
+  board: esp12e
+  restore_from_flash: true      # keep the bridge physical address after a power cut
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "HDMI-AP"
+    password: !secret ap_password
+
+captive_portal:
+
+logger:
+
+api:
+  actions:
+    # Raw send, same as the stock firmware.
+    - action: hdmi_cec_send
+      variables:
+        cec_destination: int
+        cec_data: int[]
+      then:
+        - hdmi_cec.send:
+            destination: !lambda "return static_cast<unsigned char>(cec_destination);"
+            data: !lambda |-
+              std::vector<unsigned char> vec;
+              for (int i : cec_data) vec.push_back(static_cast<unsigned char>(i));
+              return vec;
+
+    # Start a scan of the CEC bus.
+    - action: cec_scan
+      then:
+        - script.execute: scan_bus
+
+    # Control a device by name, logical address or physical address.
+    #   target:  "SHIELD" (OSD name, not case sensitive), "4" (logical address),
+    #            "1.2.0.0" (physical address, also for a Marantz input without CEC),
+    #            "TV", "AUDIO" or "ALL"
+    #   command: "on"      - wake the device (TV: Text View On + Image View On, other: Power On Function key)
+    #            "standby" - put the device in standby ("ALL" = broadcast standby)
+    #            "toggle"  - Power key (for devices that ignore "on")
+    #            "select"  - wake the TV and switch the whole HDMI path to this device
+    #                        (Set Stream Path). The device wakes, the Marantz and the TV switch input.
+    - action: cec_command
+      variables:
+        target: string
+        command: string
+      then:
+        - lambda: |-
+            int la = -1;
+            int pa = -1;
+            std::string tu;
+            for (char ch : target) tu += (char) toupper((unsigned char) ch);
+            std::string cmd;
+            for (char ch : command) cmd += (char) tolower((unsigned char) ch);
+            unsigned int a = 0, b = 0, c = 0, d = 0;
+            bool digits = !tu.empty() && tu.size() <= 2;
+            for (char ch : tu) if (ch < '0' || ch > '9') digits = false;
+
+            if (tu == "ALL") {
+              la = 15;
+            } else if (tu == "TV") {
+              la = 0; pa = 0;
+            } else if (tu == "AUDIO") {
+              la = 5;
+            } else if (sscanf(tu.c_str(), "%x.%x.%x.%x", &a, &b, &c, &d) == 4 && a < 16 && b < 16 && c < 16 && d < 16) {
+              pa = (a << 12) | (b << 8) | (c << 4) | d;
+              for (int i = 0; i < 15; i++) {
+                if (id(dev_present)[i] && id(dev_phys)[i] == (uint16_t) pa) { la = i; break; }
+              }
+            } else if (digits) {
+              la = atoi(tu.c_str());
+              if (la > 15) la = -1;
+            } else {
+              // OSD name: exact match first, then "contains"
+              for (int pass = 0; pass < 2 && la < 0; pass++) {
+                for (int i = 0; i < 15; i++) {
+                  if (!id(dev_present)[i] || id(dev_name)[i].empty()) continue;
+                  std::string nu;
+                  for (char ch : id(dev_name)[i]) nu += (char) toupper((unsigned char) ch);
+                  if ((pass == 0 && nu == tu) || (pass == 1 && nu.find(tu) != std::string::npos)) { la = i; break; }
+                }
+              }
+            }
+            if (la >= 0 && la < 15 && pa < 0 && id(dev_phys)[la] != 0xFFFF) pa = id(dev_phys)[la];
+
+            ESP_LOGI("cec", "cec_command: target '%s' -> logical %d, physical %04X, command '%s'",
+                     target.c_str(), la, (unsigned int) (pa < 0 ? 0xFFFF : pa), cmd.c_str());
+            uint8_t me = id(cec).address();
+
+            if (cmd == "standby") {
+              if (la < 0) { ESP_LOGW("cec", "standby: target not found"); return; }
+              id(cec).send(me, (uint8_t) la, {0x36});
+            } else if (cmd == "on") {
+              if (la == 0) {
+                id(cec).send(me, 0x0, {0x0D});                 // Text View On (LG)
+                id(cec).send(me, 0x0, {0x04});                 // Image View On
+              } else if (la > 0 && la < 15) {
+                id(cec).send(me, (uint8_t) la, {0x44, 0x6D});  // User Control Pressed: Power On Function
+                id(cec).send(me, (uint8_t) la, {0x45});        // User Control Released
+              } else if (pa >= 0) {
+                id(select_path).execute(pa);                   // no CEC device: switch the path
+              } else {
+                ESP_LOGW("cec", "on: target not found");
+              }
+            } else if (cmd == "toggle") {
+              if (la < 0 || la > 14) { ESP_LOGW("cec", "toggle: target not found"); return; }
+              id(cec).send(me, (uint8_t) la, {0x44, 0x40});    // User Control Pressed: Power
+              id(cec).send(me, (uint8_t) la, {0x45});
+            } else if (cmd == "select") {
+              if (pa < 0) { ESP_LOGW("cec", "select: physical address not known"); return; }
+              id(select_path).execute(pa);
+            } else {
+              ESP_LOGW("cec", "unknown command '%s' (use on, standby, toggle, select)", cmd.c_str());
+            }
+
+    # Set the logical address of this bridge (1..14, not 5). -1 = select a free one automatically.
+    - action: set_logical_address
+      variables:
+        address: int
+      then:
+        - lambda: |-
+            if (address >= 1 && address <= 14 && address != 5) {
+              id(own_la) = (uint8_t) address;
+              id(cec).set_address((uint8_t) address);
+              id(bridge_la).publish_state(std::to_string(address) + " (manual)");
+            } else if (address == -1) {
+              id(allocate_address).execute();
+            } else {
+              ESP_LOGW("cec", "set_logical_address: use 1..14 (not 5), or -1 for automatic");
+            }
+
+    # Set the physical address of this bridge, for example "3.0.0.0".
+    - action: set_physical_address
+      variables:
+        address: string
+      then:
+        - lambda: |-
+            unsigned int a = 0, b = 0, c = 0, d = 0;
+            if (sscanf(address.c_str(), "%x.%x.%x.%x", &a, &b, &c, &d) != 4 || a > 15 || b > 15 || c > 15 || d > 15) {
+              ESP_LOGW("cec", "set_physical_address: bad value '%s', use for example 3.0.0.0", address.c_str());
+              return;
+            }
+            uint16_t pa = (a << 12) | (b << 8) | (c << 4) | d;
+            id(own_phys) = pa;
+            id(cec).set_physical_address(pa);
+            char buf[24];
+            snprintf(buf, sizeof(buf), "%X.%X.%X.%X", a, b, c, d);
+            id(bridge_phys).publish_state(buf);
+            // Tell the bus the new address (Report Physical Address, device type 4 = playback)
+            id(cec).send(id(cec).address(), 0xF, {0x84, (uint8_t) (pa >> 8), (uint8_t) (pa & 0xFF), 0x04});
+
+ota:
+  - platform: esphome
+    # During an upload, stop all CEC activity. A CEC send blocks the processor,
+    # and that can break the OTA connection.
+    on_begin:
+      then:
+        - lambda: |-
+            id(ota_active) = true;
+            id(cec).set_monitor_mode(true);   // send() returns at once, no acknowledges
+            #ifdef USE_ESP8266
+            // Stop the CEC receive interrupt (GPIO14). Each CEC bit causes an interrupt,
+            // and with much bus traffic that disturbs Wi-Fi during the flash write.
+            detachInterrupt(14);
+            #endif
+        - script.stop: scan_bus
+        - script.stop: poll_power
+        - script.stop: query_device
+        - script.stop: select_path
+    on_error:
+      then:
+        # The CEC interrupt is disconnected: reboot to connect it again.
+        - delay: 2s
+        - lambda: "App.safe_reboot();"
+
+web_server:
+  port: 80
+
+external_components:
+  - source: github://Palakis/esphome-hdmi-cec
+
+# ---------------------------------------------------------------------------
+# Device table (index = logical address 0..14)
+# ---------------------------------------------------------------------------
+globals:
+  - id: own_phys
+    type: uint16_t
+    restore_value: true
+    initial_value: "${default_physical_address}"
+  - id: own_la                   # preferred logical address of this bridge
+    type: uint8_t
+    restore_value: true
+    initial_value: "0x0A"
+  - id: dev_present
+    type: std::array<bool, 15>
+    restore_value: false
+    initial_value: "std::array<bool, 15>{}"
+  - id: dev_phys                 # 0xFFFF = not known
+    type: std::array<uint16_t, 15>
+    restore_value: false
+    initial_value: "{0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF}"
+  - id: dev_power                # 0..3 = CEC power status, 0xFE = no reply, 0xFF = not known
+    type: std::array<uint8_t, 15>
+    restore_value: false
+    initial_value: "{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}"
+  - id: dev_missed               # power polls without a reply
+    type: std::array<uint8_t, 15>
+    restore_value: false
+    initial_value: "std::array<uint8_t, 15>{}"
+  - id: dev_vendor               # 0 = not known
+    type: std::array<uint32_t, 15>
+    restore_value: false
+    initial_value: "std::array<uint32_t, 15>{}"
+  - id: dev_name
+    type: std::array<std::string, 15>
+    restore_value: false
+    initial_value: "std::array<std::string, 15>{}"
+  - id: ota_active
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: scan_index
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: poll_index
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+script:
+  # Publish the slot sensor of 1 logical address, and the TV / audio system sensors.
+  - id: publish_slot
+    mode: queued
+    max_runs: 24
+    parameters:
+      la: int
+    then:
+      - lambda: |-
+          if (la < 0 || la > 14) return;
+          text_sensor::TextSensor *slots[15] = {
+            id(cec_slot_0), id(cec_slot_1), id(cec_slot_2), id(cec_slot_3),
+            id(cec_slot_4), id(cec_slot_5), id(cec_slot_6), id(cec_slot_7),
+            id(cec_slot_8), id(cec_slot_9), id(cec_slot_10), id(cec_slot_11),
+            id(cec_slot_12), id(cec_slot_13), id(cec_slot_14)};
+          std::string s;
+          uint8_t p = id(dev_power)[la];
+          if (la == id(cec).address()) {
+            s = "this bridge";
+          } else if (!id(dev_present)[la]) {
+            s = "absent";
+          } else {
+            const char *pw = (p == 0) ? "on" : (p == 1) ? "standby" : (p == 2) ? "turning_on" :
+                             (p == 3) ? "turning_off" : (p == 0xFE) ? "no_reply" : "unknown";
+            char buf[24];
+            s = pw;
+            s += " | ";
+            s += id(dev_name)[la].empty() ? std::string("?") : id(dev_name)[la];
+            s += " | ";
+            uint16_t pa = id(dev_phys)[la];
+            if (pa == 0xFFFF) {
+              s += "?";
+            } else {
+              snprintf(buf, sizeof(buf), "%X.%X.%X.%X", pa >> 12, (pa >> 8) & 0xF, (pa >> 4) & 0xF, pa & 0xF);
+              s += buf;
+            }
+            s += " | ";
+            if (id(dev_vendor)[la] == 0) {
+              s += "?";
+            } else {
+              snprintf(buf, sizeof(buf), "%06X", (unsigned int) id(dev_vendor)[la]);
+              s += buf;
+            }
+          }
+          if (!slots[la]->has_state() || slots[la]->state != s) slots[la]->publish_state(s);
+          bool on = id(dev_present)[la] && (p == 0 || p == 2);
+          if (la == 0) id(tv_on).publish_state(on);
+          if (la == 5) id(audio_on).publish_state(on);
+
+  # Select a free logical address for this bridge. Polls from address 15 (unregistered),
+  # so the bridge does not acknowledge its own poll. A candidate that nobody acknowledges is free.
+  - id: allocate_address
+    mode: single
+    then:
+      - lambda: |-
+          uint8_t old_la = id(cec).address();
+          id(cec).set_address(0xF);
+          static const uint8_t cands[] = {0x0A, 0x02, 0x09, 0x07, 0x06, 0x0B, 0x0D, 0x0C, 0x01, 0x03};
+          std::vector<uint8_t> order;
+          order.push_back(id(own_la));
+          for (auto c : cands) if (c != id(own_la)) order.push_back(c);
+          for (auto c : order) {
+            if (c == 0 || c == 5 || c > 14) continue;
+            bool taken = id(cec).send(0xF, c, {});
+            if (taken) {
+              ESP_LOGI("cec", "Logical address %d is used by another device", c);
+              continue;
+            }
+            id(cec).set_address(c);
+            id(own_la) = c;
+            id(bridge_la).publish_state(std::to_string((int) c));
+            ESP_LOGI("cec", "Bridge uses logical address %d", c);
+            if (old_la < 15) id(publish_slot).execute((int) old_la);
+            id(publish_slot).execute((int) c);
+            return;
+          }
+          ESP_LOGW("cec", "No free logical address. Bridge stays unregistered (15).");
+          id(bridge_la).publish_state("15 (no free address)");
+
+  # Ask 1 device for its physical address, OSD name, vendor ID and power status.
+  - id: query_device
+    mode: queued
+    max_runs: 16
+    parameters:
+      la: int
+    then:
+      - hdmi_cec.send:
+          destination: !lambda "return (uint8_t) la;"
+          data: [0x83]          # Give Physical Address -> broadcast 0x84
+      - delay: 150ms
+      - hdmi_cec.send:
+          destination: !lambda "return (uint8_t) la;"
+          data: [0x46]          # Give OSD Name -> 0x47
+      - delay: 150ms
+      - hdmi_cec.send:
+          destination: !lambda "return (uint8_t) la;"
+          data: [0x8C]          # Give Device Vendor ID -> broadcast 0x87
+      - delay: 150ms
+      - hdmi_cec.send:
+          destination: !lambda "return (uint8_t) la;"
+          data: [0x8F]          # Give Device Power Status -> 0x90
+      - delay: 150ms
+
+  # Send a polling message to logical addresses 0..14. A device that acknowledges is present.
+  - id: scan_bus
+    mode: single
+    then:
+      - lambda: "id(scan_index) = 0;"
+      - repeat:
+          count: 15
+          then:
+            - lambda: |-
+                int la = id(scan_index)++;
+                if (la == id(cec).address()) return;
+                bool ack = id(cec).send(id(cec).address(), (uint8_t) la, {});
+                if (ack) {
+                  if (!id(dev_present)[la]) {
+                    id(dev_present)[la] = true;
+                    id(dev_missed)[la] = 0;
+                    id(publish_slot).execute(la);
+                  }
+                  id(query_device).execute(la);
+                } else if (id(dev_present)[la]) {
+                  id(dev_present)[la] = false;
+                  id(dev_power)[la] = 0xFF;
+                  id(publish_slot).execute(la);
+                }
+            - delay: 300ms
+
+  # Ask each present device for its power status.
+  - id: poll_power
+    mode: single
+    then:
+      - lambda: "id(poll_index) = 0;"
+      - repeat:
+          count: 15
+          then:
+            - lambda: |-
+                int la = id(poll_index)++;
+                if (!id(dev_present)[la] || la == id(cec).address()) return;
+                bool ack = id(cec).send(id(cec).address(), (uint8_t) la, {0x8F});
+                uint8_t &m = id(dev_missed)[la];
+                if (m < 255) m++;
+                if (!ack && m >= 10) {
+                  // No acknowledge for 5 minutes: device is removed or has CEC off.
+                  id(dev_present)[la] = false;
+                  id(dev_power)[la] = 0xFF;
+                  id(publish_slot).execute(la);
+                } else if (m > 3 && id(dev_power)[la] != 0xFE) {
+                  // No power reply for 3 polls (90 s).
+                  id(dev_power)[la] = 0xFE;
+                  id(publish_slot).execute(la);
+                }
+            - delay: 200ms
+
+  # Wake the TV and switch the whole HDMI path to a physical address (Set Stream Path).
+  # The target device wakes and the Marantz and TV switch their input.
+  # Sent 2 times, because some devices ignore it while they wake up.
+  - id: select_path
+    mode: restart
+    parameters:
+      pa: int
+    then:
+      - hdmi_cec.send:
+          destination: 0x0
+          data: [0x0D]          # Text View On -> TV (LG)
+      - delay: 300ms
+      - hdmi_cec.send:
+          destination: 0x0
+          data: [0x04]          # Image View On -> TV
+      - delay: 2s
+      - hdmi_cec.send:
+          destination: 0xF
+          data: !lambda "return std::vector<uint8_t>{0x86, (uint8_t) ((pa >> 8) & 0xFF), (uint8_t) (pa & 0xFF)};"
+      - delay: 4s
+      - hdmi_cec.send:
+          destination: 0xF
+          data: !lambda "return std::vector<uint8_t>{0x86, (uint8_t) ((pa >> 8) & 0xFF), (uint8_t) (pa & 0xFF)};"
+
+  # Publish the active source: physical address + device name from the table.
+  - id: publish_active
+    mode: queued
+    max_runs: 8
+    parameters:
+      pa: int
+      src: int                  # logical address of the sender, -1 = not known
+    then:
+      - lambda: |-
+          char buf[24];
+          snprintf(buf, sizeof(buf), "%X.%X.%X.%X", (pa >> 12) & 0xF, (pa >> 8) & 0xF, (pa >> 4) & 0xF, pa & 0xF);
+          id(active_source).publish_state(buf);
+          int la = src;
+          if (la < 0 || la > 14) {
+            la = -1;
+            for (int i = 0; i < 15; i++) {
+              if (id(dev_present)[i] && id(dev_phys)[i] == (uint16_t) pa) { la = i; break; }
+            }
+          }
+          std::string name;
+          if (la < 0) {
+            name = "unknown (no CEC)";
+          } else {
+            name = id(dev_name)[la].empty() ? std::string("?") : id(dev_name)[la];
+            name += " (CEC " + std::to_string(la) + ")";
+          }
+          id(active_source_device).publish_state(name);
+
+# ---------------------------------------------------------------------------
+# Sensors
+# ---------------------------------------------------------------------------
+text_sensor:
+  - platform: template
+    name: "CEC 0 (TV)"
+    id: cec_slot_0
+    icon: mdi:hdmi-port
+    update_interval: never
+  - platform: template
+    name: "CEC 1 (Recorder 1)"
+    id: cec_slot_1
+    icon: mdi:hdmi-port
+    update_interval: never
+  - platform: template
+    name: "CEC 2 (Recorder 2)"
+    id: cec_slot_2
+    icon: mdi:hdmi-port
+    update_interval: never
+  - platform: template
+    name: "CEC 3 (Tuner 1)"
+    id: cec_slot_3
+    icon: mdi:hdmi-port
+    update_interval: never
+  - platform: template
+    name: "CEC 4 (Playback 1)"
+    id: cec_slot_4
+    icon: mdi:hdmi-port
+    update_interval: never
+  - platform: template
+    name: "CEC 5 (Audio system)"
+    id: cec_slot_5
+    icon: mdi:hdmi-port
+    update_interval: never
+  - platform: template
+    name: "CEC 6 (Tuner 2)"
+    id: cec_slot_6
+    icon: mdi:hdmi-port
+    update_interval: never
+  - platform: template
+    name: "CEC 7 (Tuner 3)"
+    id: cec_slot_7
+    icon: mdi:hdmi-port
+    update_interval: never
+  - platform: template
+    name: "CEC 8 (Playback 2)"
+    id: cec_slot_8
+    icon: mdi:hdmi-port
+    update_interval: never
+  - platform: template
+    name: "CEC 9 (Recorder 3)"
+    id: cec_slot_9
+    icon: mdi:hdmi-port
+    update_interval: never
+  - platform: template
+    name: "CEC 10 (Tuner 4)"
+    id: cec_slot_10
+    icon: mdi:hdmi-port
+    update_interval: never
+  - platform: template
+    name: "CEC 11 (Playback 3)"
+    id: cec_slot_11
+    icon: mdi:hdmi-port
+    update_interval: never
+  - platform: template
+    name: "CEC 12 (Reserved)"
+    id: cec_slot_12
+    icon: mdi:hdmi-port
+    update_interval: never
+  - platform: template
+    name: "CEC 13 (Reserved)"
+    id: cec_slot_13
+    icon: mdi:hdmi-port
+    update_interval: never
+  - platform: template
+    name: "CEC 14 (Specific use)"
+    id: cec_slot_14
+    icon: mdi:hdmi-port
+    update_interval: never
+
+  - platform: template
+    name: "Active source"
+    id: active_source            # physical address, for example "1.2.0.0"
+    icon: mdi:video-input-hdmi
+    update_interval: never
+
+  - platform: template
+    name: "Active source device"
+    id: active_source_device     # for example "SHIELD (CEC 4)"
+    icon: mdi:video-input-hdmi
+    update_interval: never
+
+  - platform: template
+    name: "Last CEC message"
+    id: cec_last_message         # raw frame, for example "4F:82:12:00"
+    icon: mdi:message-processing
+    update_interval: never
+    # Useful for tests. Exclude it from the recorder or disable it after the tests.
+
+  - platform: template
+    name: "Bridge physical address"
+    id: bridge_phys
+    icon: mdi:hdmi-port
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: template
+    name: "Bridge logical address"
+    id: bridge_la
+    icon: mdi:hdmi-port
+    entity_category: diagnostic
+    update_interval: never
+
+binary_sensor:
+  - platform: template
+    name: "TV"
+    id: tv_on
+    device_class: power
+
+  - platform: template
+    name: "Audio system"
+    id: audio_on
+    device_class: power
+
+# ---------------------------------------------------------------------------
+# CEC bus
+# ---------------------------------------------------------------------------
+hdmi_cec:
+  id: cec
+  pin: GPIO14
+  address: 0x0F                  # unregistered until "allocate_address" selects a free address at boot
+  physical_address: ${default_physical_address}   # replaced at boot by the value in flash
+  osd_name: "SLWF-08-HDMI"
+  promiscuous_mode: true         # see all messages, not only messages to this bridge
+  monitor_mode: false
+  on_message:
+
+    # 1. All messages -> replies, HA event, "Last CEC message", passive discovery
+    #    (skipped during an OTA upload)
+    - then:
+        - if:
+            condition:
+              lambda: "return !id(ota_active);"
+            then:
+            - lambda: |-
+                // Passive discovery: an unknown sender is added and queried.
+                // (The bridge also receives its own frames: ignore those.)
+                if (source < 15 && source != id(cec).address() && !id(dev_present)[source]) {
+                  id(dev_present)[source] = true;
+                  id(dev_missed)[source] = 0;
+                  id(publish_slot).execute((int) source);
+                  id(query_device).execute((int) source);
+                }
+                // Answer requests addressed to this bridge (required by the CEC standard).
+                uint8_t me = id(cec).address();
+                if (destination == me && me != 0xF && source != me && !data.empty()) {
+                  uint8_t op = data[0];
+                  switch (op) {
+                    case 0x83: {  // Give Physical Address -> Report Physical Address (broadcast)
+                      uint16_t pa = id(own_phys);
+                      uint8_t type = (me == 4 || me == 8 || me == 11) ? 4 : (me == 1 || me == 2 || me == 9) ? 1 :
+                                     (me == 3 || me == 6 || me == 7 || me == 10) ? 3 : 4;
+                      id(cec).send(me, 0xF, {0x84, (uint8_t) (pa >> 8), (uint8_t) (pa & 0xFF), type});
+                      break;
+                    }
+                    case 0x46: {  // Give OSD Name -> Set OSD Name
+                      std::vector<uint8_t> r = {0x47};
+                      for (char ch : std::string("SLWF-08-HDMI")) r.push_back((uint8_t) ch);
+                      id(cec).send(me, source, r);
+                      break;
+                    }
+                    case 0x8F:    // Give Device Power Status -> On
+                      id(cec).send(me, source, {0x90, 0x00});
+                      break;
+                    case 0x9F:    // Get CEC Version -> 1.4
+                      id(cec).send(me, source, {0x9E, 0x05});
+                      break;
+                    case 0x8C:    // Give Device Vendor ID -> Device Vendor ID (broadcast).
+                                  // The LG does not accept Feature Abort here and asks again each 14 s.
+                      id(cec).send(me, 0xF, {0x87, 0x00, 0x00, 0x00});
+                      break;
+                    // Replies and information messages: no answer
+                    case 0x00: case 0x36: case 0x47: case 0x72: case 0x7A: case 0x7E: case 0x80:
+                    case 0x81: case 0x82: case 0x84: case 0x86: case 0x87: case 0x8E: case 0x90:
+                    case 0x9E: case 0xA6:
+                      break;
+                    default:      // Not supported -> Feature Abort (reason 0 = unrecognized opcode)
+                      id(cec).send(me, source, {0x00, op, 0x00});
+                      break;
+                  }
+                }
+                // Do not put the power poll replies in the sensor history.
+                if (destination == me && !data.empty() && data[0] == 0x90) return;
+                std::string hex;
+                char b[8];
+                snprintf(b, sizeof(b), "%X%X", source & 0x0F, destination & 0x0F);
+                hex = b;
+                for (auto d : data) { snprintf(b, sizeof(b), ":%02X", d); hex += b; }
+                id(cec_last_message).publish_state(hex);
+            - homeassistant.event:
+                event: esphome.hdmi_cec
+                data:
+                  source: !lambda "return std::to_string((int) source);"
+                  destination: !lambda "return std::to_string((int) destination);"
+                  opcode: !lambda "return std::to_string(data.empty() ? -1 : (int) data[0]);"
+                  raw: !lambda |-
+                    std::string hex;
+                    char b[8];
+                    snprintf(b, sizeof(b), "%X%X", source & 0x0F, destination & 0x0F);
+                    hex = b;
+                    for (auto d : data) { snprintf(b, sizeof(b), ":%02X", d); hex += b; }
+                    return hex;
+
+    # 2. Report Physical Address (0x84): physical address + device type
+    - opcode: 0x84
+      then:
+        - lambda: |-
+            if (data.size() < 3 || source > 14 || source == id(cec).address()) return;
+            id(dev_phys)[source] = (data[1] << 8) | data[2];
+            // Conflict check: another device reports the physical address of this bridge.
+            if (id(dev_phys)[source] == id(own_phys)) {
+              ESP_LOGW("cec", "Physical address conflict with CEC %d. Use set_physical_address.", (int) source);
+              id(bridge_phys).publish_state("conflict with CEC " + std::to_string((int) source));
+            }
+            // Many TVs send this when they wake up.
+            if (source == 0) id(dev_power)[0] = 0;
+            id(publish_slot).execute((int) source);
+
+    # 3. Set OSD Name (0x47): device name, for example "SHIELD"
+    - opcode: 0x47
+      then:
+        - lambda: |-
+            if (data.size() < 2 || source > 14 || source == id(cec).address()) return;
+            std::string n;
+            for (size_t i = 1; i < data.size(); i++) {
+              char c = (char) data[i];
+              if (c >= 0x20 && c < 0x7F && c != '|') n += c;
+            }
+            id(dev_name)[source] = n;
+            id(publish_slot).execute((int) source);
+
+    # 4. Device Vendor ID (0x87)
+    - opcode: 0x87
+      then:
+        - lambda: |-
+            if (data.size() < 4 || source > 14 || source == id(cec).address()) return;
+            id(dev_vendor)[source] = ((uint32_t) data[1] << 16) | ((uint32_t) data[2] << 8) | data[3];
+            id(publish_slot).execute((int) source);
+
+    # 5. Report Power Status (0x90)
+    - opcode: 0x90
+      then:
+        - lambda: |-
+            if (data.size() < 2 || source > 14 || source == id(cec).address()) return;
+            id(dev_missed)[source] = 0;
+            if (id(dev_power)[source] != data[1]) {
+              id(dev_power)[source] = data[1];
+              id(publish_slot).execute((int) source);
+            }
+
+    # 6. TV sends Standby -> TV goes off
+    - source: 0x0
+      opcode: 0x36
+      then:
+        - lambda: |-
+            id(dev_power)[0] = 1;
+            id(publish_slot).execute(0);
+
+    # 7. Active Source (0x82): a device says "show me". It is on.
+    - opcode: 0x82
+      then:
+        - lambda: |-
+            if (data.size() < 3) return;
+            int pa = (data[1] << 8) | data[2];
+            if (source < 15 && source != id(cec).address()) {
+              id(dev_phys)[source] = pa;
+              if (id(dev_power)[source] != 0) { id(dev_power)[source] = 0; }
+              id(publish_slot).execute((int) source);
+            }
+            id(publish_active).execute(pa, (int) source);
+
+    # 8. Set Stream Path (0x86): the TV selects an input
+    - opcode: 0x86
+      then:
+        - lambda: |-
+            if (data.size() < 3) return;
+            id(publish_active).execute((data[1] << 8) | data[2], -1);
+
+    # 9. Routing Change (0x80): a switch (for example the Marantz) changes its input
+    - opcode: 0x80
+      then:
+        - lambda: |-
+            if (data.size() < 5) return;
+            id(publish_active).execute((data[3] << 8) | data[4], -1);
+
+interval:
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: "return !id(ota_active);"
+              - not:
+                  script.is_running: scan_bus
+              - not:
+                  script.is_running: poll_power
+          then:
+            - script.execute: poll_power
+  - interval: 10min
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: "return !id(ota_active);"
+              - not:
+                  script.is_running: scan_bus
+          then:
+            - script.execute: scan_bus
+
+# ---------------------------------------------------------------------------
+# Buttons (TV = 0 and audio system = 5 are fixed by the CEC standard)
+# Use the "hdmi_cec_send" action for other devices, with the address from the CEC slot sensors.
+# ---------------------------------------------------------------------------
+button:
+  - platform: template
+    name: "CEC scan"
+    icon: mdi:magnify-scan
+    on_press:
+      - script.execute: scan_bus
+
+  - platform: template
+    name: "TV on"
+    icon: mdi:television
+    on_press:
+      - hdmi_cec.send:
+          destination: 0x0
+          data: [0x0D]          # Text View On (the LG reacts to this, as the Shield uses it)
+      - delay: 300ms
+      - hdmi_cec.send:
+          destination: 0x0
+          data: [0x04]          # Image View On
+
+  - platform: template
+    name: "TV standby"
+    icon: mdi:television-off
+    on_press:
+      - hdmi_cec.send:
+          destination: 0x0
+          data: [0x36]          # Standby
+
+  - platform: template
+    name: "All devices standby"
+    icon: mdi:power-sleep
+    on_press:
+      - hdmi_cec.send:
+          destination: 0xF
+          data: [0x36]
+
+  - platform: template
+    name: "Request active source"
+    icon: mdi:help-network
+    on_press:
+      - hdmi_cec.send:
+          destination: 0xF
+          data: [0x85]
+
+  # Same names as the stock buttons, so the HA entities stay the same.
+  - platform: template
+    name: "Volume up"
+    on_press:
+      - hdmi_cec.send:
+          destination: 0x5
+          data: [0x44, 0x41]    # User Control Pressed: Volume Up
+      - delay: 100ms
+      - hdmi_cec.send:
+          destination: 0x5
+          data: [0x45]          # User Control Released
+
+  - platform: template
+    name: "Volume Down"
+    on_press:
+      - hdmi_cec.send:
+          destination: 0x5
+          data: [0x44, 0x42]
+      - delay: 100ms
+      - hdmi_cec.send:
+          destination: 0x5
+          data: [0x45]
+
+  - platform: template
+    name: "Mute"
+    on_press:
+      - hdmi_cec.send:
+          destination: 0x5
+          data: [0x44, 0x43]
+      - delay: 100ms
+      - hdmi_cec.send:
+          destination: 0x5
+          data: [0x45]

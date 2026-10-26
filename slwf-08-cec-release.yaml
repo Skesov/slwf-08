@@ -1,0 +1,11 @@
+# Release build of slwf-08-cec.yaml: no Wi-Fi credentials inside the firmware.
+# After flashing, the bridge starts the open access point "HDMI-AP" and a captive
+# portal. Connect to it and choose your Wi-Fi network there.
+packages:
+  base: !include slwf-08-cec.yaml
+
+wifi:
+  ssid: !remove
+  password: !remove
+  ap:
+    password: !remove
