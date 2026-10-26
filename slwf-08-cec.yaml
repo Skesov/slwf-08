@@ -37,7 +37,7 @@ substitutions:
   name: "hdmi-control-palakis"
   friendly_name: "HDMI Control - palakis"
   project_name: "SMLIGHT.SLWF-08-HDMI"
-  project_version: "3.4-generic"
+  project_version: "1.0.0"
   # Default physical address of this bridge: TV HDMI 3 = 3.0.0.0.
   # Used only on the first boot. After that, the value in flash is used
   # (change it with the "set_physical_address" action).
