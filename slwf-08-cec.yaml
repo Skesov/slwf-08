@@ -44,6 +44,9 @@ substitutions:
   default_physical_address: "0x3000"
   # Name shown by the TV for this input (Set OSD Name, up to 14 characters).
   osd_name: "SLWF-08-HDMI"
+  # Preferred logical address of this bridge (1..14, not 5). Used only on the
+  # first boot, then the value in flash ("set_logical_address" action).
+  default_logical_address: "0x0A"
 
 esphome:
   name: "${name}"
@@ -267,7 +270,7 @@ globals:
   - id: own_la                   # preferred logical address of this bridge
     type: uint8_t
     restore_value: true
-    initial_value: "0x0A"
+    initial_value: "${default_logical_address}"
   - id: dev_present
     type: std::array<bool, 15>
     restore_value: false
