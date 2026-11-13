@@ -42,6 +42,8 @@ substitutions:
   # Used only on the first boot. After that, the value in flash is used
   # (change it with the "set_physical_address" action).
   default_physical_address: "0x3000"
+  # Name shown by the TV for this input (Set OSD Name, up to 14 characters).
+  osd_name: "SLWF-08-HDMI"
 
 esphome:
   name: "${name}"
@@ -642,7 +644,7 @@ hdmi_cec:
   pin: GPIO14
   address: 0x0F                  # unregistered until "allocate_address" selects a free address at boot
   physical_address: ${default_physical_address}   # replaced at boot by the value in flash
-  osd_name: "SLWF-08-HDMI"
+  osd_name: "${osd_name}"
   promiscuous_mode: true         # see all messages, not only messages to this bridge
   monitor_mode: false
   on_message:
@@ -677,7 +679,7 @@ hdmi_cec:
                     }
                     case 0x46: {  // Give OSD Name -> Set OSD Name
                       std::vector<uint8_t> r = {0x47};
-                      for (char ch : std::string("SLWF-08-HDMI")) r.push_back((uint8_t) ch);
+                      for (char ch : std::string("${osd_name}")) r.push_back((uint8_t) ch);
                       id(cec).send(me, source, r);
                       break;
                     }
